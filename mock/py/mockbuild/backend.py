@@ -60,6 +60,7 @@ class Commands(object):
         self.no_root_shells = config['no_root_shells']
 
         self.private_network = not config['rpmbuild_networking']
+        self.network_isolation = config.get('network_isolation', 'auto')
         self.rpmbuild_noclean_option = None
 
         # on-demand buildroot properties
@@ -366,12 +367,35 @@ class Commands(object):
 
         try:
             self.state.start("shell")
+
+            # NAT network isolation for interactive shell
+            nat_network = None
+            if not self.private_network:
+                network_isolation = self.network_isolation
+                use_nat = network_isolation in ('nat', 'auto')
+                if use_nat and util.USE_NSPAWN and not util.check_nspawn_has_network_namespace_path_option():
+                    log.warning("NAT network isolation requires systemd-nspawn with "
+                                "--network-namespace-path (systemd >= 242). "
+                                "Falling back to shared network for shell.")
+                    use_nat = False
+                if use_nat:
+                    from .network import NatNetwork
+                    try:
+                        nat_network = NatNetwork(self.config,
+                                                 chroot_path=self.buildroot.make_chroot_path())
+                        nat_network.setup()
+                    except Exception as e:
+                        log.warning("NAT network setup failed for shell, "
+                                    "falling back to shared network: %s", e)
+                        nat_network = None
+
             ret = util.doshell(chrootPath=self.buildroot.make_chroot_path(),
                                environ=self.buildroot.env, uid=uid, gid=gid,
                                cwd=cwd,
                                nspawn_args=self.config.get("nspawn_args", []),
                                unshare_net=self.private_network,
-                               cmd=cmd)
+                               cmd=cmd,
+                               nat_network=nat_network)
         finally:
             log.debug("shell: unmounting all filesystems")
             self.state.finish("shell")

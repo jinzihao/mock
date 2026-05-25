@@ -301,6 +301,28 @@ class _PackageManager(object):
             kwargs.setdefault("pty", True)
         self.buildroot.nuke_rpm_db()
 
+        # NAT network isolation for package manager commands.
+        # Package manager commands (dnf install, dnf builddep) currently run
+        # with shared host network (unshare_net=False). When network_isolation
+        # is 'nat' or 'auto', we create a veth pair + NAT instead.
+        network_isolation = self.config.get('network_isolation', 'auto')
+        use_nat = False
+        if network_isolation == 'nat':
+            use_nat = True
+        elif network_isolation == 'auto':
+            # Package manager always needs network, so use NAT instead
+            # of shared host network in auto mode
+            use_nat = True
+
+        # NAT mode requires nspawn with --network-namespace-path
+        # (available since systemd 242).  Without it, fall back.
+        if use_nat and util.USE_NSPAWN and not util.check_nspawn_has_network_namespace_path_option():
+            self.buildroot.root_log.warning(
+                "NAT network isolation requires systemd-nspawn with "
+                "--network-namespace-path (systemd >= 242). "
+                "Falling back to shared network for package manager.")
+            use_nat = False
+
         error = None
         max_attempts = int(self.config['package_manager_max_attempts'])
         for attempt in range(max(max_attempts, 1)):
@@ -312,6 +334,22 @@ class _PackageManager(object):
                 time.sleep(sleep_seconds)
 
             try:
+                # Set up NAT network for this attempt if needed.
+                # Each attempt gets a fresh NatNetwork since do_with_status
+                # tears it down in its finally block.
+                if use_nat:
+                    try:
+                        from .network import NatNetwork
+                        nat_network = NatNetwork(self.config,
+                                                 chroot_path=self.buildroot.make_chroot_path())
+                        nat_network.setup()
+                        kwargs['nat_network'] = nat_network
+                    except Exception as e:
+                        self.buildroot.root_log.warning(
+                            "NAT network setup failed for package manager, "
+                            "falling back to shared network: %s", e)
+                        kwargs.pop('nat_network', None)
+
                 # either it does not support --installroot (microdnf) or
                 # it is bootstrap image made by container with incomaptible dnf/rpm
                 personality = kwargs.pop("personality", None)
@@ -323,8 +361,13 @@ class _PackageManager(object):
                                   chrootPath=self.buildroot.make_chroot_path(),
                                   personality=personality, **kwargs)
                 elif self.bootstrap_buildroot is None:
-
-
+                    # Running DNF with --installroot on the host (no
+                    # chrootPath, no nspawn).  NAT network isolation
+                    # does not work here because the host's resolv.conf
+                    # may point to 127.0.0.53 (systemd-resolved) which
+                    # is unreachable from a network namespace.  Remove
+                    # nat_network so the command uses the host network.
+                    kwargs.pop('nat_network', None)
                     out = util.do(invocation, env=env,
                                   personality=personality, **kwargs)
                 else:

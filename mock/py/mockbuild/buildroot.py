@@ -435,6 +435,49 @@ class Buildroot(object):
         kargs.setdefault("nspawn_args", [])
         kargs["nspawn_args"].extend(self.config.get("nspawn_args", []))
 
+        # NAT network isolation: when network_isolation='nat' (or 'auto'
+        # resolving to 'nat') and the command currently gets shared host
+        # network (unshare_net=False), create a veth pair + NAT instead.
+        nat_network = None
+        unshare_net = kargs.get('unshare_net', False)
+        network_isolation = self.config.get('network_isolation', 'auto')
+        use_nat = False
+        if network_isolation == 'nat':
+            use_nat = True
+        elif network_isolation == 'auto':
+            # In auto mode, use NAT for commands that currently share the
+            # host network (unshare_net=False). Commands that are already
+            # isolated (unshare_net=True) keep loopback-only.
+            use_nat = not unshare_net
+
+        if use_nat:
+            # NAT mode requires nspawn with --network-namespace-path
+            # (available since systemd 242).  Without it, nspawn cannot
+            # use a pre-created network namespace, so we fall back.
+            if util.USE_NSPAWN and not util.check_nspawn_has_network_namespace_path_option():
+                self.root_log.warning(
+                    "NAT network isolation requires systemd-nspawn with "
+                    "--network-namespace-path (systemd >= 242). "
+                    "Falling back to %s network.",
+                    "shared" if not unshare_net else "loopback")
+                use_nat = False
+
+        if use_nat:
+            from .network import NatNetwork
+            try:
+                nat_network = NatNetwork(self.config,
+                                         chroot_path=self.make_chroot_path())
+                nat_network.setup()
+                kargs['nat_network'] = nat_network
+                # When using NAT, the namespace is pre-created so we
+                # should not also call condUnshareNet in the child.
+                # The ChildPreExec handles this by checking nat_ns_path.
+            except Exception as e:
+                self.root_log.warning(
+                    "NAT network setup failed, falling back to %s: %s",
+                    "shared network" if not unshare_net else "loopback", e)
+                nat_network = None
+
         try:
             result = util.do_with_status(command, chrootPath=self.make_chroot_path(),
                                          env=env, *args, **kargs)
@@ -449,6 +492,7 @@ class Buildroot(object):
         buildroot  in `cwd`, as a non-privileged user.  Used by plugins.
         """
         private_network = not self.config.get('rpmbuild_networking', False)
+        # doChroot handles network_isolation resolution, including NAT setup
         return self.doChroot(
             command,
             shell=False,

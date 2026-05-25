@@ -526,7 +526,7 @@ def do(*args, **kargs):
 def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, raiseExc=True,
                    returnOutput=0, uid=None, gid=None, user=None, personality=None,
                    printOutput=False, env=None, pty=False, nspawn_args=None, unshare_net=False,
-                   returnStderr=True, *_, **kargs):
+                   returnStderr=True, nat_network=None, *_, **kargs):
     logger = kargs.get("logger", getLog())
     if timeout == 0:
         timeout = _OPS_TIMEOUT
@@ -536,8 +536,16 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
         lead_pty, sub_pty = os.openpty()
         resize_pty(sub_pty)
         reader = os.fdopen(lead_pty, 'rb')
+
+    # Determine effective network mode
+    nat_ns_path = None
+    if nat_network is not None:
+        # NAT network was set up by the caller — use it
+        nat_ns_path = nat_network.ns_path
+
     preexec = ChildPreExec(personality, chrootPath, cwd, uid, gid,
-                           unshare_ipc=bool(chrootPath), unshare_net=unshare_net)
+                           unshare_ipc=bool(chrootPath), unshare_net=unshare_net,
+                           nat_ns_path=nat_ns_path, nat_network=nat_network)
     if env is None:
         env = clean_env()
     stdout = None
@@ -552,7 +560,8 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
             logger.debug("Using nspawn with args %s", nspawn_args)
             command = _prepare_nspawn_command(chrootPath, user, command,
                                               nspawn_args=nspawn_args,
-                                              env=env, cwd=cwd, shell=shell)
+                                              env=env, cwd=cwd, shell=shell,
+                                              nat_ns_path=nat_ns_path)
             shell = False
         logger.debug("Executing command: %s with env %s and shell %s", command, env, shell)
         with open(os.devnull, "r") as stdin:
@@ -591,6 +600,12 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
             reader.close()
         if stdout:
             stdout.close()
+        # Teardown NAT network after child exits (even on error)
+        if nat_network is not None:
+            try:
+                nat_network.teardown()
+            except Exception as e:
+                logger.warning("NAT teardown failed: %s", e)
 
     # wait until child is done, kill it if it passes timeout
     niceExit = 1
@@ -616,11 +631,13 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
 class ChildPreExec(object):
     def __init__(self, personality, chrootPath, cwd, uid, gid, env=None,
                  shell=False, unshare_ipc=False, unshare_net=False,
-                 no_setsid=False):
+                 no_setsid=False, nat_ns_path=None, nat_network=None):
         """
         Params:
         - no_setsid - assure we don't call os.setsid(), as the process we run
             calls that itself
+        - nat_ns_path - path to a pre-created network namespace for NAT mode
+        - nat_network - NatNetwork object for configuring container-side interface
         """
         self.personality = personality
         self.chrootPath = chrootPath
@@ -632,13 +649,25 @@ class ChildPreExec(object):
         self.unshare_ipc = unshare_ipc
         self.unshare_net = unshare_net
         self.no_setsid = no_setsid
+        self.nat_ns_path = nat_ns_path
+        self.nat_network = nat_network
         getLog().debug("child environment: %s", env)
 
     def __call__(self, *args, **kargs):
         if not self.shell and not self.no_setsid:
             os.setsid()
         os.umask(DEFAULT_UMASK)
-        condUnshareNet(self.unshare_net)
+
+        if self.nat_ns_path:
+            # NAT mode: enter the pre-created namespace and configure
+            # the container-side interface, instead of creating a new one
+            from .network import setns
+            setns(self.nat_ns_path)
+            if self.nat_network:
+                self.nat_network.configure_container_ns()
+        else:
+            condUnshareNet(self.unshare_net)
+
         condPersonality(self.personality)
         condEnvironment(self.env)
         # Even if nspawn is allowed to be used, it won't be used unless there
@@ -744,8 +773,17 @@ def check_nspawn_has_suppress_sync_option():
     """
     return '--suppress-sync' in systemd_nspawn_help_output()
 
+def check_nspawn_has_network_namespace_path_option():
+    """
+    The --network-namespace-path option was added in systemd 242.
+    Without it, NAT network isolation cannot use a pre-created network namespace
+    with nspawn.  When systemd 242 is everywhere we can remove this.
+    """
+    return '--network-namespace-path' in systemd_nspawn_help_output()
+
 def _prepare_nspawn_command(chrootPath, user, cmd, nspawn_args=None, env=None,
-                            cwd=None, interactive=False, shell=False):
+                            cwd=None, interactive=False, shell=False,
+                            nat_ns_path=None):
     nspawn_argv = ['/usr/bin/systemd-nspawn', '-q', '-M', uuid.uuid4().hex, '-D', chrootPath]
     distro_label = distro.id()
     try:
@@ -759,6 +797,11 @@ def _prepare_nspawn_command(chrootPath, user, cmd, nspawn_args=None, env=None,
     if user:
         # user can be either id or name
         nspawn_argv += ['-u', str(user)]
+
+    # When using a pre-created network namespace for NAT, tell nspawn
+    # to use it instead of creating its own network configuration
+    if nat_ns_path:
+        nspawn_argv.append('--network-namespace-path={0}'.format(nat_ns_path))
 
     if nspawn_args:
         nspawn_argv.extend(nspawn_args)
@@ -799,7 +842,8 @@ def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
             cwd=None,
             nspawn_args=None,
             unshare_ipc=True,
-            unshare_net=False):
+            unshare_net=False,
+            nat_network=None):
     log = getLog()
     log.debug("doshell: chrootPath:%s, uid:%d, gid:%d", chrootPath, uid, gid)
     if environ is None:
@@ -811,6 +855,11 @@ def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
     if 'SHELL' not in environ:
         environ['SHELL'] = '/bin/sh'
     log.debug("doshell environment: %s", environ)
+
+    # Determine NAT namespace path for ChildPreExec
+    nat_ns_path = None
+    if nat_network is not None:
+        nat_ns_path = nat_network.ns_path
 
     no_setsid = False
     shell = True
@@ -824,17 +873,26 @@ def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
     preexec = ChildPreExec(personality=None, chrootPath=chrootPath, cwd=cwd,
                            uid=uid, gid=gid, env=environ, shell=shell,
                            unshare_ipc=unshare_ipc, unshare_net=unshare_net,
-                           no_setsid=no_setsid)
+                           no_setsid=no_setsid,
+                           nat_ns_path=nat_ns_path, nat_network=nat_network)
 
     if USE_NSPAWN:
         # nspawn cannot set gid
         log.debug("Using nspawn with args %s", nspawn_args)
         cmd = _prepare_nspawn_command(chrootPath, uid, cmd, nspawn_args=nspawn_args, env=environ,
-                                      interactive=True, cwd=cwd)
+                                      interactive=True, cwd=cwd,
+                                      nat_ns_path=nat_ns_path)
         shell = False
 
     log.debug("doshell: command: %s", cmd_pretty(cmd))
-    return subprocess.call(cmd, preexec_fn=preexec, env=environ, shell=shell)
+    try:
+        return subprocess.call(cmd, preexec_fn=preexec, env=environ, shell=shell)
+    finally:
+        if nat_network is not None:
+            try:
+                nat_network.teardown()
+            except Exception as e:
+                log.warning("NAT teardown failed after shell: %s", e)
 
 
 def run(cmd, isShell=True):
