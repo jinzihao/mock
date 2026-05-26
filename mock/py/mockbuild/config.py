@@ -116,6 +116,15 @@ def setup_default_config_opts():
     # FIXME disable as default because of https://github.com/rpm-software-management/mock/issues/1641
     # if check_nspawn_has_suppress_sync_option():
     #    config_opts['nspawn_args'] += ['--suppress-sync=yes']
+    config_opts['device_isolation'] = True
+    # Enforce a strict cgroup device allowlist (DevicePolicy=closed) via nspawn's
+    # transient scope unit properties.  This prevents root inside the container
+    # from opening real host hardware devices (raw disks, /dev/mem, /dev/kvm,
+    # GPUs, etc.) even after a privilege escalation, while still allowing all
+    # virtual/interface devices that legitimate builds need (/dev/loop*, /dev/fuse,
+    # /dev/mapper/*, /dev/null, /dev/urandom, etc.).
+    # Set to False only if you have a specific build that needs a real hardware
+    # device — this would be a strong signal of a malicious or misconfigured package.
     config_opts['use_container_host_hostname'] = True
 
     config_opts['use_bootstrap'] = True

@@ -145,6 +145,7 @@ class Buildroot(object):
         self._setup_nspawn_devicemapper_device()
         self._setup_nspawn_fuse_device()
         self._setup_nspawn_loop_devices()
+        self._setup_nspawn_device_policy()
 
 
     def set_package_manager(self, fallback=None):
@@ -913,6 +914,88 @@ class Buildroot(object):
                 if e.errno != errno.EEXIST:
                     raise
             self.config['nspawn_args'].append('--bind={0}'.format(loop_file))
+
+    @traceLog()
+    def _setup_nspawn_device_policy(self):
+        """
+        Enforce a strict cgroup device allowlist via nspawn's transient scope
+        unit properties.
+
+        Without this, the container's cgroup inherits 'a *:* rwm' from its
+        parent, meaning even root inside the container can mknod and open
+        arbitrary host hardware devices (raw disks, /dev/mem, /dev/kvm, etc.)
+        which is a critical security boundary violation.
+
+        We set DevicePolicy=closed and then explicitly allow only the virtual/
+        interface devices that mock already deliberately exposes.  Real hardware
+        devices (block disks, /dev/mem, /dev/kvm, GPU, input devices, etc.) are
+        never on the allowlist and therefore cannot be opened even by root,
+        because the kernel device cgroup controller enforces this regardless of
+        capability set.
+
+        This mirrors the network isolation approach: we don't block all devices,
+        we carve out the specific virtual interfaces the build legitimately needs
+        while keeping real hardware inaccessible.
+        """
+        if not util.USE_NSPAWN or self.is_bootstrap:
+            return
+        if not self.config.get('device_isolation', True):
+            return
+
+        # DevicePolicy=closed denies all devices by default; only those listed
+        # in DeviceAllow= entries below are accessible.
+        props = ['--property=DevicePolicy=closed']
+
+        # --- Pseudo-devices: char major 1 (pure kernel constructs) ---
+        # We enumerate individually to exclude /dev/mem (1:1) and /dev/kmem (1:2)
+        # which share major 1 with the safe devices below.
+        # /dev/null (1:3), /dev/zero (1:5), /dev/full (1:7)
+        props.append('--property=DeviceAllow=/dev/null rwm')
+        props.append('--property=DeviceAllow=/dev/zero rwm')
+        props.append('--property=DeviceAllow=/dev/full rwm')
+        # /dev/random (1:8), /dev/urandom (1:9)
+        props.append('--property=DeviceAllow=/dev/random rwm')
+        props.append('--property=DeviceAllow=/dev/urandom rwm')
+
+        # --- Terminal devices (virtual, per-namespace in nspawn) ---
+        # /dev/tty (5:0), /dev/console (5:1), /dev/ptmx (5:2)
+        props.append('--property=DeviceAllow=/dev/tty rwm')
+        props.append('--property=DeviceAllow=/dev/console rwm')
+        props.append('--property=DeviceAllow=/dev/ptmx rwm')
+        # /dev/pts/* — pseudo-terminal slaves; use kernel named group
+        props.append('--property=DeviceAllow=char-pts rw')
+
+        # --- Filesystem interface devices (virtual kernel interfaces) ---
+        # /dev/fuse (10:229) — FUSE mount interface; needed by libguestfs etc.
+        props.append('--property=DeviceAllow=/dev/fuse rwm')
+        # /dev/btrfs-control (10:234) — btrfs ioctl interface
+        props.append('--property=DeviceAllow=/dev/btrfs-control rwm')
+        # /dev/mapper/control (10:236) — device-mapper ioctl interface
+        props.append('--property=DeviceAllow=/dev/mapper/control rwm')
+        # /dev/loop-control (10:237) — loop device allocator
+        props.append('--property=DeviceAllow=/dev/loop-control rwm')
+
+        # --- Loop block devices (virtual, backed by files not real disks) ---
+        # block 7:* — /dev/loop0 through /dev/loopN
+        props.append('--property=DeviceAllow=block-loop rwm')
+
+        # --- Device-mapper block devices (virtual volumes, not real disks) ---
+        # These are dynamically assigned major numbers by the kernel.
+        # Use the kernel-named group 'block-device-mapper' which is portable.
+        props.append('--property=DeviceAllow=block-device-mapper rwm')
+
+        # NOTE: The following are deliberately NOT allowed:
+        #   /dev/mem (1:1), /dev/kmem (1:2)  — raw kernel/physical memory
+        #   /dev/kvm (10:232)                — KVM hypervisor
+        #   /dev/sd*, /dev/nvme*, /dev/vd*   — real disk devices
+        #   /dev/dri/*, /dev/video*          — GPU / video capture
+        #   /dev/input/*                     — keyboard, mouse, joystick
+        #   /dev/net/tun                     — TUN/TAP (use NAT isolation instead)
+        # No legitimate build %check needs any of these.
+
+        self.config['nspawn_args'].extend(props)
+        self.root_log.debug("device isolation: DevicePolicy=closed enforced with %d DeviceAllow entries",
+                            len(props) - 1)
 
     @traceLog()
     def _setup_devices(self):

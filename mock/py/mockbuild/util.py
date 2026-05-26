@@ -21,6 +21,7 @@ import select
 import signal
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -81,6 +82,7 @@ personality_defs = {
 
 USE_NSPAWN = False
 USE_NSPAWN_SECCOMP = False
+_DEVICE_ISOLATION = False
 
 _NSPAWN_HELP_OUTPUT = None
 
@@ -518,6 +520,66 @@ def do(*args, **kargs):
 # logger =
 # output = [1|0]
 # chrootPath
+def _device_isolation_scope_args():
+    """
+    Build the systemd-run --scope arguments for device isolation.
+
+    Instead of racing to write cgroup device policy after nspawn starts
+    (which leaves a window where the payload has full device access),
+    we pre-create a restricted scope using systemd-run.  nspawn then
+    runs inside this scope with --keep-unit, so the payload process is
+    born into an already-restricted cgroup — zero race window.
+
+    On cgroup v1, systemd's DevicePolicy=closed is enforced via BPF_DEVCG
+    (eBPF device control) when the scope is created by systemd-run, but
+    NOT when nspawn creates its own scope via D-Bus.  This approach
+    eliminates that inconsistency.
+
+    On cgroup v2, systemd enforces DevicePolicy natively via eBPF in
+    all cases, so this is equally effective.
+
+    Returns a list of arguments to prepend to the nspawn command,
+    e.g. ['systemd-run', '--scope', '--property=DevicePolicy=closed', ...]
+    or an empty list if device isolation is disabled.
+    """
+    if not _DEVICE_ISOLATION:
+        return []
+
+    args = ['systemd-run', '--scope']
+
+    # DevicePolicy=closed denies all devices by default
+    args.append('--property=DevicePolicy=closed')
+
+    # --- Pseudo-devices: char major 1 ---
+    # Enumerate individually to exclude /dev/mem (1:1) and /dev/kmem (1:2)
+    args.append('--property=DeviceAllow=/dev/null rwm')
+    args.append('--property=DeviceAllow=/dev/zero rwm')
+    args.append('--property=DeviceAllow=/dev/full rwm')
+    args.append('--property=DeviceAllow=/dev/random rwm')
+    args.append('--property=DeviceAllow=/dev/urandom rwm')
+
+    # --- Terminal devices ---
+    args.append('--property=DeviceAllow=/dev/tty rwm')
+    args.append('--property=DeviceAllow=/dev/console rwm')
+    args.append('--property=DeviceAllow=/dev/ptmx rwm')
+    args.append('--property=DeviceAllow=char-pts rw')
+
+    # --- Filesystem interface devices ---
+    args.append('--property=DeviceAllow=/dev/fuse rwm')
+    args.append('--property=DeviceAllow=/dev/btrfs-control rwm')
+    args.append('--property=DeviceAllow=/dev/mapper/control rwm')
+    args.append('--property=DeviceAllow=/dev/loop-control rwm')
+
+    # --- Loop block devices ---
+    args.append('--property=DeviceAllow=block-loop rwm')
+
+    # --- Device-mapper block devices ---
+    args.append('--property=DeviceAllow=block-device-mapper rwm')
+
+    return args
+
+
+
 #
 # The "Not-as-complicated" version
 #
@@ -577,6 +639,7 @@ def do_with_status(command, shell=False, chrootPath=None, cwd=None, timeout=0, r
             )
             if not pty:
                 stdout = child.stdout
+
             with child.stderr:
                 # use select() to poll for output so we dont block
                 output = logOutput(
@@ -688,8 +751,10 @@ def setup_operations_timeout(config_opts):
 def set_use_nspawn(value, config_opts):
     global USE_NSPAWN
     global USE_NSPAWN_SECCOMP
+    global _DEVICE_ISOLATION
     USE_NSPAWN = value
     USE_NSPAWN_SECCOMP = config_opts["seccomp"]
+    _DEVICE_ISOLATION = config_opts.get('device_isolation', True)
 
 
 class BindMountedFile(str):
@@ -836,7 +901,21 @@ def _prepare_nspawn_command(chrootPath, user, cmd, nspawn_args=None, env=None,
     if isinstance(cmd, str):
         cmd = ['/bin/sh', '-c', cmd]
 
-    return nspawn_argv + cmd
+    full_cmd = nspawn_argv + cmd
+
+    # When device isolation is active, wrap nspawn in a systemd-run scope
+    # with DevicePolicy=closed.  This pre-creates a restricted scope so
+    # nspawn's payload process is born into an already-restricted cgroup —
+    # no race window where the process has full device access.
+    # nspawn must use --keep-unit to stay in our pre-created scope instead
+    # of creating its own.
+    if _DEVICE_ISOLATION:
+        scope_args = _device_isolation_scope_args()
+        if scope_args:
+            # Insert --keep-unit after the nspawn binary path
+            full_cmd[0:1] = scope_args + full_cmd[:1] + ['--keep-unit']
+
+    return full_cmd
 
 def doshell(chrootPath=None, environ=None, uid=None, gid=None, cmd=None,
             cwd=None,
