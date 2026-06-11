@@ -387,6 +387,11 @@ class Commands(object):
                     except Exception as e:
                         log.warning("NAT network setup failed for shell, "
                                     "falling back to shared network: %s", e)
+                        if nat_network is not None:
+                            try:
+                                nat_network.teardown()
+                            except Exception:
+                                pass
                         nat_network = None
 
             ret = util.doshell(chrootPath=self.buildroot.make_chroot_path(),

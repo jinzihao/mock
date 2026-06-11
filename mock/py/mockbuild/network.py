@@ -148,7 +148,100 @@ class SubnetPool:
         else:
             self.pool_v6 = [ipaddress.IPv6Network(n) for n in (pool_v6 or [])]
 
-    def allocate(self):
+    @staticmethod
+    def _parse_line(line):
+        """Parse a lock file line into (subnet_str, pid, ns_name).
+
+        Lock file format::
+            192.168.200.0/30 pid=12345 ns=m-a1b2c3d4
+        Legacy format (no pid/ns) is also accepted.
+        """
+        parts = line.split()
+        subnet = parts[0] if parts else ''
+        pid = None
+        ns_name = None
+        for p in parts[1:]:
+            if p.startswith('pid='):
+                try:
+                    pid = int(p[4:])
+                except ValueError:
+                    pass
+            elif p.startswith('ns='):
+                ns_name = p[3:]
+        return subnet, pid, ns_name
+
+    @staticmethod
+    def _is_pid_alive(pid):
+        """Check whether a process PID still exists."""
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but we lack permission to signal it
+            return True
+        except OSError:
+            return False
+
+    def _read_lock_file(self, lock_fd):
+        """Read the lock file and return a list of parsed entries."""
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        data = os.read(lock_fd, 65536).decode('utf-8')
+        entries = []
+        for line in data.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                entries.append(self._parse_line(line))
+        return entries
+
+    def _write_lock_file(self, lock_fd, entries):
+        """Write parsed entries back to the lock file."""
+        lines = []
+        for subnet, pid, ns_name in entries:
+            parts = [subnet]
+            if pid is not None:
+                parts.append('pid=%d' % pid)
+            if ns_name is not None:
+                parts.append('ns=%s' % ns_name)
+            lines.append(' '.join(parts))
+        os.ftruncate(lock_fd, 0)
+        os.lseek(lock_fd, 0, os.SEEK_SET)
+        content = '\n'.join(sorted(lines))
+        if content:
+            content += '\n'
+        os.write(lock_fd, content.encode('utf-8'))
+
+    def reap_dead(self):
+        """Release subnets belonging to dead processes.
+
+        Scans the lock file for entries whose PID no longer exists and
+        removes them.  Returns a list of namespace names (``ns=`` values)
+        of the reaped entries so callers can clean up orphaned resources.
+        """
+        reaped_ns = []
+        _ensure_lock_dir()
+        lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            entries = self._read_lock_file(lock_fd)
+            alive = []
+            for subnet, pid, ns_name in entries:
+                if pid is not None and not self._is_pid_alive(pid):
+                    # Process is dead — release the subnet
+                    reaped_ns.append(ns_name)
+                    getLog().info(
+                        "NAT SubnetPool: reaping dead entry pid=%d ns=%s "
+                        "subnet=%s", pid, ns_name, subnet)
+                else:
+                    alive.append((subnet, pid, ns_name))
+            self._write_lock_file(lock_fd, alive)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        return reaped_ns
+
+    def allocate(self, ns_name=None):
         """
         Allocate a unique subnet pair (v4, v6) from the pool.
 
@@ -159,14 +252,21 @@ class SubnetPool:
         lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            # Read current allocation state using raw fd I/O
-            os.lseek(lock_fd, 0, os.SEEK_SET)
-            data = os.read(lock_fd, 65536).decode('utf-8')
-            allocated = set()
-            for line in data.splitlines():
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    allocated.add(line)
+
+            # Reap subnets belonging to dead processes before allocating.
+            # This prevents pool exhaustion when mock processes are killed
+            # (SIGKILL) without running teardown.
+            entries = self._read_lock_file(lock_fd)
+            alive = []
+            for subnet, pid, ns_name in entries:
+                if pid is not None and not self._is_pid_alive(pid):
+                    getLog().info(
+                        "NAT SubnetPool: reaping dead entry pid=%d ns=%s "
+                        "subnet=%s", pid, ns_name, subnet)
+                else:
+                    alive.append((subnet, pid, ns_name))
+
+            allocated = set(e[0] for e in alive)
 
             # Find an unallocated v4 subnet
             for net in self.pool_v4:
@@ -181,13 +281,11 @@ class SubnetPool:
                         if v6_key in allocated:
                             # v6 already taken, skip this pair
                             continue
-                        allocated.add(v6_key)
+                        alive.append((v6_key, None, None))
 
-                    allocated.add(key)
-                    # Write back using raw fd I/O
-                    os.ftruncate(lock_fd, 0)
-                    os.lseek(lock_fd, 0, os.SEEK_SET)
-                    os.write(lock_fd, '\n'.join(sorted(allocated)).encode('utf-8') + b'\n')
+                    pid = os.getpid()
+                    alive.append((key, pid, ns_name))
+                    self._write_lock_file(lock_fd, alive)
                     return net, v6_net
 
             raise RuntimeError("No available subnets in NAT pool. "
@@ -202,25 +300,15 @@ class SubnetPool:
         lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            os.lseek(lock_fd, 0, os.SEEK_SET)
-            data = os.read(lock_fd, 65536).decode('utf-8')
-            allocated = set()
-            for line in data.splitlines():
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    allocated.add(line)
-
-            allocated.discard(str(v4_net))
-            if v6_net:
-                allocated.discard(str(v6_net))
-
-            # Write back using raw fd I/O
-            os.ftruncate(lock_fd, 0)
-            os.lseek(lock_fd, 0, os.SEEK_SET)
-            content = '\n'.join(sorted(allocated))
-            if content:
-                content += '\n'
-            os.write(lock_fd, content.encode('utf-8'))
+            entries = self._read_lock_file(lock_fd)
+            v4_str = str(v4_net)
+            v6_str = str(v6_net) if v6_net else None
+            kept = []
+            for subnet, pid, ns_name in entries:
+                if subnet == v4_str or (v6_str and subnet == v6_str):
+                    continue
+                kept.append((subnet, pid, ns_name))
+            self._write_lock_file(lock_fd, kept)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
@@ -286,7 +374,7 @@ class NatNetwork:
                            /var/run/netns/mock-a1b2c3d4
         """
         log = getLog()
-        self.v4_net, self.v6_net = self._pool.allocate()
+        self.v4_net, self.v6_net = self._pool.allocate(ns_name=self.ns_name)
 
         # Derive host/container IPs from the subnet
         # For a /29, we use .1 for host and .2 for container
@@ -439,8 +527,16 @@ class NatNetwork:
         """
         Tear down the NAT network. Called in the PARENT process after
         the child exits.
+
+        Safe to call after partial setup (idempotent) — if setup()
+        failed partway through, this will release the subnet and skip
+        any resources that were never created.
         """
         log = getLog()
+
+        # If allocate() was never called, nothing to clean up
+        if self.v4_net is None:
+            return
 
         # Restore the original resolv.conf
         if self.chroot_path:
@@ -610,3 +706,141 @@ def setns(ns_path, netns_type=CLONE_NEWNET):
     except Exception as e:
         log.error("setns: failed to enter namespace %s: %s", ns_path, e)
         raise
+
+
+def cleanup_orphaned_networks(pool_v4='', pool_v6=''):
+    """
+    Clean up NAT network resources left behind by killed mock processes.
+
+    When a mock process is killed (SIGKILL), it cannot run its teardown
+    code, leaving behind: allocated subnets in the lock file, veth
+    interfaces on the host, network namespaces, and iptables NAT rules.
+
+    This function:
+      1. Reaps dead-process entries from the subnet lock file.
+      2. Removes veth interfaces, namespaces, and iptables rules for
+         the reaped namespaces.
+      3. Scans for any remaining ``vm-m-*`` interfaces whose namespace
+         is not in the lock file and cleans those up too.
+
+    Should be called early in mock startup (before any builds) so that
+    resources from previous killed builds are reclaimed.
+    """
+    log = getLog()
+    pool = SubnetPool(pool_v4, pool_v6)
+
+    # Step 1: Reap dead-process entries from the lock file
+    reaped_ns = pool.reap_dead()
+
+    # Step 2: For each reaped namespace, remove leftover resources
+    for ns_name in reaped_ns:
+        if ns_name is None:
+            continue
+        host_if = 'vm-' + ns_name
+        log.info("NAT: cleaning up orphaned resources for ns=%s", ns_name)
+
+        # Remove iptables NAT rules (find by comment marker)
+        marker = 'mock-' + ns_name
+        try:
+            rules = subprocess.run(
+                ['iptables', '-t', 'nat', '-S', 'POSTROUTING'],
+                capture_output=True, text=True, check=False)
+            for rule in rules.stdout.splitlines():
+                if marker in rule:
+                    # Convert "-A" to "-D" to delete the rule
+                    delete_rule = rule.replace('-A POSTROUTING',
+                                               '-D POSTROUTING', 1)
+                    subprocess.run(
+                        ['iptables', '-t', 'nat'] + delete_rule.split(),
+                        check=False)
+                    log.info("NAT: removed iptables rule: %s", delete_rule)
+        except Exception as e:
+            log.warning("NAT: failed to clean iptables for ns=%s: %s",
+                        ns_name, e)
+
+        # Remove ip6tables NAT rules
+        try:
+            rules = subprocess.run(
+                ['ip6tables', '-t', 'nat', '-S', 'POSTROUTING'],
+                capture_output=True, text=True, check=False)
+            for rule in rules.stdout.splitlines():
+                if marker in rule:
+                    delete_rule = rule.replace('-A POSTROUTING',
+                                               '-D POSTROUTING', 1)
+                    subprocess.run(
+                        ['ip6tables', '-t', 'nat'] + delete_rule.split(),
+                        check=False)
+                    log.info("NAT: removed ip6tables rule: %s", delete_rule)
+        except Exception as e:
+            log.warning("NAT: failed to clean ip6tables for ns=%s: %s",
+                        ns_name, e)
+
+        # Remove FORWARD rules
+        try:
+            subprocess.run(
+                ['iptables', '-D', 'FORWARD', '-i', host_if, '-j', 'ACCEPT'],
+                check=False)
+            subprocess.run(
+                ['iptables', '-D', 'FORWARD', '-o', host_if, '-j', 'ACCEPT'],
+                check=False)
+            subprocess.run(
+                ['ip6tables', '-D', 'FORWARD', '-i', host_if, '-j', 'ACCEPT'],
+                check=False)
+            subprocess.run(
+                ['ip6tables', '-D', 'FORWARD', '-o', host_if, '-j', 'ACCEPT'],
+                check=False)
+        except Exception:
+            pass
+
+        # Delete the veth interface
+        try:
+            ipr = IPRoute()
+            host_idx = ipr.link_lookup(ifname=host_if)
+            if host_idx:
+                ipr.link('del', index=host_idx[0])
+                log.info("NAT: removed orphaned veth %s", host_if)
+        except Exception as e:
+            log.warning("NAT: failed to delete veth %s: %s", host_if, e)
+
+        # Delete the network namespace
+        try:
+            netns.remove(ns_name)
+            log.info("NAT: removed orphaned namespace %s", ns_name)
+        except Exception as e:
+            log.warning("NAT: failed to remove namespace %s: %s", ns_name, e)
+
+    # Step 3: Scan for any vm-m-* interfaces whose namespace is NOT
+    # in the lock file — these are truly orphaned.
+    try:
+        ipr = IPRoute()
+        for link in ipr.get_links():
+            ifname = link.get_attr('IFLA_IFNAME', '')
+            if not ifname.startswith('vm-m-'):
+                continue
+            ns_name = ifname[3:]  # strip "vm-" prefix to get namespace name
+            # Check if this namespace is still tracked in the lock file
+            _ensure_lock_dir()
+            lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                entries = pool._read_lock_file(lock_fd)
+                ns_in_use = any(e[2] == ns_name for e in entries)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+            if not ns_in_use:
+                log.info("NAT: cleaning up truly orphaned interface %s "
+                         "(ns=%s not in lock file)", ifname, ns_name)
+                try:
+                    ipr.link('del', index=link['index'])
+                except Exception as e:
+                    log.warning("NAT: failed to delete orphaned veth %s: %s",
+                                ifname, e)
+                try:
+                    netns.remove(ns_name)
+                except Exception as e:
+                    log.warning("NAT: failed to remove orphaned ns %s: %s",
+                                ns_name, e)
+    except Exception as e:
+        log.warning("NAT: orphan interface scan failed: %s", e)

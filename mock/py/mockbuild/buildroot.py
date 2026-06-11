@@ -146,6 +146,7 @@ class Buildroot(object):
         self._setup_nspawn_fuse_device()
         self._setup_nspawn_loop_devices()
         self._setup_nspawn_device_policy()
+        self._cleanup_orphaned_nat_networks()
 
 
     def set_package_manager(self, fallback=None):
@@ -477,6 +478,13 @@ class Buildroot(object):
                 self.root_log.warning(
                     "NAT network setup failed, falling back to %s: %s",
                     "shared network" if not unshare_net else "loopback", e)
+                # Release the subnet if allocate() succeeded but later
+                # setup steps failed. teardown() is idempotent.
+                if nat_network is not None:
+                    try:
+                        nat_network.teardown()
+                    except Exception:
+                        pass
                 nat_network = None
 
         try:
@@ -996,6 +1004,23 @@ class Buildroot(object):
         self.config['nspawn_args'].extend(props)
         self.root_log.debug("device isolation: DevicePolicy=closed enforced with %d DeviceAllow entries",
                             len(props) - 1)
+
+    @traceLog()
+    def _cleanup_orphaned_nat_networks(self):
+        """Clean up NAT network resources left behind by killed mock processes."""
+        if not util.USE_NSPAWN or self.is_bootstrap:
+            return
+        network_isolation = self.config.get('network_isolation', 'auto')
+        if network_isolation == 'loopback':
+            return
+        try:
+            from .network import cleanup_orphaned_networks
+            cleanup_orphaned_networks(
+                pool_v4=self.config.get('network_veth_subnet_block', ''),
+                pool_v6=self.config.get('network_veth_subnet_block_v6', ''),
+            )
+        except Exception as e:
+            self.root_log.debug("NAT orphan cleanup skipped: %s", e)
 
     @traceLog()
     def _setup_devices(self):

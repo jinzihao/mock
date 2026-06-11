@@ -348,6 +348,13 @@ class _PackageManager(object):
                         self.buildroot.root_log.warning(
                             "NAT network setup failed for package manager, "
                             "falling back to shared network: %s", e)
+                        # Release the subnet if allocate() succeeded but later
+                        # setup steps failed. teardown() is idempotent.
+                        if nat_network is not None:
+                            try:
+                                nat_network.teardown()
+                            except Exception:
+                                pass
                         kwargs.pop('nat_network', None)
 
                 # either it does not support --installroot (microdnf) or
@@ -365,9 +372,14 @@ class _PackageManager(object):
                     # chrootPath, no nspawn).  NAT network isolation
                     # does not work here because the host's resolv.conf
                     # may point to 127.0.0.53 (systemd-resolved) which
-                    # is unreachable from a network namespace.  Remove
-                    # nat_network so the command uses the host network.
-                    kwargs.pop('nat_network', None)
+                    # is unreachable from a network namespace.  Tear down
+                    # the NAT network and run with host network instead.
+                    nat_net = kwargs.pop('nat_network', None)
+                    if nat_net is not None:
+                        try:
+                            nat_net.teardown()
+                        except Exception:
+                            pass
                     out = util.do(invocation, env=env,
                                   personality=personality, **kwargs)
                 else:
