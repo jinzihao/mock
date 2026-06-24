@@ -94,6 +94,10 @@ def setup_default_config_opts():
     config_opts['isolation'] = None
     config_opts['use_nspawn'] = None
     config_opts['rpmbuild_networking'] = False
+    config_opts['device_isolation'] = False
+    # When True, restrict the build environment to a whitelist of devices
+    # by running systemd-nspawn inside a systemd-run --scope with
+    # DevicePolicy=closed.  This is only effective when use_nspawn is True.
     config_opts['nspawn_args'] = ['--capability=cap_ipc_lock']
     # FIXME disable as default because of https://github.com/rpm-software-management/mock/issues/1641
     # if check_nspawn_has_suppress_sync_option():
