@@ -687,11 +687,13 @@ def setns(ns_path, netns_type=CLONE_NEWNET):
     log = getLog()
     try:
         fd = os.open(ns_path, os.O_RDONLY)
-        ret = _libc.setns(fd, netns_type)
-        if ret != 0:
-            err = ctypes.get_errno()
-            raise OSError(err, os.strerror(err))
-        os.close(fd)
+        try:
+            ret = _libc.setns(fd, netns_type)
+            if ret != 0:
+                err = ctypes.get_errno()
+                raise OSError(err, os.strerror(err))
+        finally:
+            os.close(fd)
         log.debug("setns: entered namespace %s", ns_path)
     except Exception as e:
         log.error("setns: failed to enter namespace %s: %s", ns_path, e)
