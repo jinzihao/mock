@@ -256,19 +256,19 @@ class SubnetPool:
             allocated = set(e[0] for e in alive)
 
             # Find an unallocated v4 subnet
-            for net in self.pool_v4:
+            for idx, net in enumerate(self.pool_v4):
                 key = str(net)
                 if key not in allocated:
                     # Find matching v6 subnet (same index)
                     v6_net = None
-                    idx = self.pool_v4.index(net)
                     if idx < len(self.pool_v6):
                         v6_net = self.pool_v6[idx]
                         v6_key = str(v6_net)
                         if v6_key in allocated:
                             # v6 already taken, skip this pair
                             continue
-                        alive.append((v6_key, None, None))
+                        pid = os.getpid()
+                        alive.append((v6_key, pid, ns_name))
 
                     pid = os.getpid()
                     alive.append((key, pid, ns_name))
