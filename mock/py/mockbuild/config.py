@@ -94,6 +94,24 @@ def setup_default_config_opts():
     config_opts['isolation'] = None
     config_opts['use_nspawn'] = None
     config_opts['rpmbuild_networking'] = False
+    config_opts['network_isolation'] = 'loopback'
+    # 'loopback': current behavior (isolated loopback only)
+    # 'shared': full host network (legacy, insecure)
+    # 'nat': isolated namespace with veth + NAT
+    # 'auto': use 'nat' for commands needing network, 'loopback' otherwise
+    config_opts['network_veth_subnet_block'] = '192.168.200.0/24'
+    # IPv4 CIDR block subdivided into /30 subnets for build namespaces.
+    # A /30 uses exactly 4 addresses (host .1, container .2, network, broadcast).
+    # A /24 provides 64 concurrent build slots. Use a /22 for 256 slots.
+    config_opts['network_veth_subnet_block_v6'] = ''
+    # IPv6 CIDR block subdivided into /64 subnets. Leave empty to disable IPv6.
+    # Example: 'fd00:dead:beef::/48'
+    config_opts['network_fallback_dns'] = ['8.8.8.8', '1.1.1.1']
+    # DNS servers written to the build environment's resolv.conf when the
+    # host's /etc/resolv.conf only contains loopback addresses
+    # (e.g. 127.0.0.53 from systemd-resolved, which is unreachable from
+    # inside the NAT namespace). Override if these servers are not reachable
+    # from your network.
     config_opts['nspawn_args'] = ['--capability=cap_ipc_lock']
     # FIXME disable as default because of https://github.com/rpm-software-management/mock/issues/1641
     # if check_nspawn_has_suppress_sync_option():

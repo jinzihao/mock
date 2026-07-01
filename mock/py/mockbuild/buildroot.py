@@ -145,6 +145,7 @@ class Buildroot(object):
         self._setup_nspawn_devicemapper_device()
         self._setup_nspawn_fuse_device()
         self._setup_nspawn_loop_devices()
+        self._cleanup_orphaned_nat_networks()
 
 
     def set_package_manager(self, fallback=None):
@@ -435,6 +436,31 @@ class Buildroot(object):
         kargs.setdefault("nspawn_args", [])
         kargs["nspawn_args"].extend(self.config.get("nspawn_args", []))
 
+        # NAT network isolation: when network_isolation='nat' (or 'auto'
+        # resolving to 'nat') and the command currently gets shared host
+        # network (unshare_net=False), create a veth pair + NAT instead.
+        nat_network = None
+        unshare_net = kargs.get('unshare_net', False)
+        network_isolation = self.config.get('network_isolation', 'loopback')
+        use_nat = False
+        if network_isolation == 'nat':
+            use_nat = True
+        elif network_isolation == 'auto':
+            # In auto mode, use NAT for commands that currently share the
+            # host network (unshare_net=False). Commands that are already
+            # isolated (unshare_net=True) keep loopback-only.
+            use_nat = not unshare_net
+
+        if use_nat:
+            from .network import create_nat_network
+            nat_network = create_nat_network(
+                self.config, self.root_log, self.make_chroot_path(),
+                util.USE_NSPAWN)
+            if nat_network is not None:
+                kargs['nat_network'] = nat_network
+            else:
+                use_nat = False
+
         try:
             result = util.do_with_status(command, chrootPath=self.make_chroot_path(),
                                          env=env, *args, **kargs)
@@ -449,6 +475,7 @@ class Buildroot(object):
         buildroot  in `cwd`, as a non-privileged user.  Used by plugins.
         """
         private_network = not self.config.get('rpmbuild_networking', False)
+        # doChroot handles network_isolation resolution, including NAT setup
         return self.doChroot(
             command,
             shell=False,
@@ -869,6 +896,23 @@ class Buildroot(object):
                 if e.errno != errno.EEXIST:
                     raise
             self.config['nspawn_args'].append('--bind={0}'.format(loop_file))
+
+    @traceLog()
+    def _cleanup_orphaned_nat_networks(self):
+        """Clean up NAT network resources left behind by killed mock processes."""
+        if not util.USE_NSPAWN or self.is_bootstrap:
+            return
+        network_isolation = self.config.get('network_isolation', 'loopback')
+        if network_isolation == 'loopback':
+            return
+        try:
+            from .network import cleanup_orphaned_networks
+            cleanup_orphaned_networks(
+                pool_v4=self.config.get('network_veth_subnet_block', ''),
+                pool_v6=self.config.get('network_veth_subnet_block_v6', ''),
+            )
+        except Exception as e:
+            self.root_log.debug("NAT orphan cleanup skipped: %s", e)
 
     @traceLog()
     def _setup_devices(self):

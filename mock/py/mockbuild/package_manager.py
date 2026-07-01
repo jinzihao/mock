@@ -301,6 +301,12 @@ class _PackageManager(object):
             kwargs.setdefault("pty", True)
         self.buildroot.nuke_rpm_db()
 
+        # NAT network isolation for package manager commands.
+        # Package manager commands (dnf install, dnf builddep) always need
+        # network access, so use NAT when network_isolation is not 'loopback'.
+        network_isolation = self.config.get('network_isolation', 'loopback')
+        use_nat = (network_isolation != 'loopback')
+
         error = None
         max_attempts = int(self.config['package_manager_max_attempts'])
         for attempt in range(max(max_attempts, 1)):
@@ -312,6 +318,19 @@ class _PackageManager(object):
                 time.sleep(sleep_seconds)
 
             try:
+                # Set up NAT network for this attempt if needed.
+                # Each attempt gets a fresh NatNetwork since do_with_status
+                # tears it down in its finally block.
+                if use_nat:
+                    from .network import create_nat_network
+                    nat_network = create_nat_network(
+                        self.config, self.buildroot.root_log,
+                        self.buildroot.make_chroot_path(), util.USE_NSPAWN)
+                    if nat_network is not None:
+                        kwargs['nat_network'] = nat_network
+                    else:
+                        kwargs.pop('nat_network', None)
+
                 # either it does not support --installroot (microdnf) or
                 # it is bootstrap image made by container with incomaptible dnf/rpm
                 personality = kwargs.pop("personality", None)
@@ -323,8 +342,18 @@ class _PackageManager(object):
                                   chrootPath=self.buildroot.make_chroot_path(),
                                   personality=personality, **kwargs)
                 elif self.bootstrap_buildroot is None:
-
-
+                    # Running DNF with --installroot on the host (no
+                    # chrootPath, no nspawn).  NAT network isolation
+                    # does not work here because the host's resolv.conf
+                    # may point to 127.0.0.53 (systemd-resolved) which
+                    # is unreachable from a network namespace.  Tear down
+                    # the NAT network and run with host network instead.
+                    nat_net = kwargs.pop('nat_network', None)
+                    if nat_net is not None:
+                        try:
+                            nat_net.teardown()
+                        except Exception:
+                            pass
                     out = util.do(invocation, env=env,
                                   personality=personality, **kwargs)
                 else:

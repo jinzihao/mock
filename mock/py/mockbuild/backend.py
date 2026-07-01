@@ -60,6 +60,7 @@ class Commands(object):
         self.no_root_shells = config['no_root_shells']
 
         self.private_network = not config['rpmbuild_networking']
+        self.network_isolation = config.get('network_isolation', 'loopback')
         self.rpmbuild_noclean_option = None
 
         # on-demand buildroot properties
@@ -366,12 +367,23 @@ class Commands(object):
 
         try:
             self.state.start("shell")
+
+            # NAT network isolation for interactive shell
+            nat_network = None
+            if not self.private_network:
+                if self.network_isolation != 'loopback':
+                    from .network import create_nat_network
+                    nat_network = create_nat_network(
+                        self.config, log, self.buildroot.make_chroot_path(),
+                        util.USE_NSPAWN)
+
             ret = util.doshell(chrootPath=self.buildroot.make_chroot_path(),
                                environ=self.buildroot.env, uid=uid, gid=gid,
                                cwd=cwd,
                                nspawn_args=self.config.get("nspawn_args", []),
                                unshare_net=self.private_network,
-                               cmd=cmd)
+                               cmd=cmd,
+                               nat_network=nat_network)
         finally:
             log.debug("shell: unmounting all filesystems")
             self.state.finish("shell")
