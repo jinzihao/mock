@@ -866,7 +866,7 @@ def _prepare_nspawn_command(chrootPath, user, cmd, nspawn_args=None, env=None,
         scope_args = _device_isolation_scope_args()
         if scope_args:
             # Insert --keep-unit after the nspawn binary path
-            full_cmd[0:1] = scope_args + full_cmd[:1] + ['--keep-unit']
+            full_cmd = scope_args + [full_cmd[0], '--keep-unit'] + full_cmd[1:]
 
     return full_cmd
 
