@@ -718,7 +718,7 @@ def setup_operations_timeout(config_opts):
 def set_use_nspawn(value, config_opts):
     global USE_NSPAWN
     global USE_NSPAWN_SECCOMP
-    global _DEVICE_ISOLATION
+    global _DEVICE_ISOLATION  # pylint: disable=global-statement
     USE_NSPAWN = value
     USE_NSPAWN_SECCOMP = config_opts["seccomp"]
     _DEVICE_ISOLATION = config_opts.get('device_isolation', False)
