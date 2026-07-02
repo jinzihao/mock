@@ -173,8 +173,11 @@ class SubnetPool:
 
     def _read_lock_file(self, lock_fd):
         """Read the lock file and return a list of parsed entries."""
+        size = os.fstat(lock_fd).st_size
+        if size == 0:
+            return []
         os.lseek(lock_fd, 0, os.SEEK_SET)
-        data = os.read(lock_fd, 65536).decode('utf-8')
+        data = os.read(lock_fd, size).decode('utf-8')
         entries = []
         for line in data.splitlines():
             line = line.strip()
