@@ -383,23 +383,23 @@ class NatNetwork:
         netns.create(self.ns_name)
 
         # 2. Create veth pair in host namespace
-        ipr = IPRoute()
-        ipr.link('add', ifname=self.host_if, kind='veth', peer=self.cont_if)
+        with IPRoute() as ipr:
+            ipr.link('add', ifname=self.host_if, kind='veth', peer=self.cont_if)
 
-        # 3. Move container end into the new namespace
-        cont_idx = ipr.link_lookup(ifname=self.cont_if)[0]
-        ipr.link('set', index=cont_idx, net_ns_fd=self.ns_name)
+            # 3. Move container end into the new namespace
+            cont_idx = ipr.link_lookup(ifname=self.cont_if)[0]
+            ipr.link('set', index=cont_idx, net_ns_fd=self.ns_name)
 
-        # 4. Configure host end
-        host_idx = ipr.link_lookup(ifname=self.host_if)[0]
-        ipr.link('set', index=host_idx, state='up')
-        ipr.addr('add', index=host_idx, address=self.host_ip_v4,
-                 mask=self.mask_v4)
+            # 4. Configure host end
+            host_idx = ipr.link_lookup(ifname=self.host_if)[0]
+            ipr.link('set', index=host_idx, state='up')
+            ipr.addr('add', index=host_idx, address=self.host_ip_v4,
+                     mask=self.mask_v4)
 
-        # 5. Configure IPv6 on host end
-        if self.host_ip_v6:
-            ipr.addr('add', index=host_idx, address=self.host_ip_v6,
-                     mask=self.mask_v6)
+            # 5. Configure IPv6 on host end
+            if self.host_ip_v6:
+                ipr.addr('add', index=host_idx, address=self.host_ip_v6,
+                         mask=self.mask_v6)
 
         # 6. Set up iptables NAT for IPv4
         self._setup_iptables_nat()
@@ -480,34 +480,33 @@ class NatNetwork:
         Called INSIDE the child process, after entering the network namespace
         (via setns), before exec'ing nspawn.
         """
-        ipr = IPRoute()
+        with IPRoute() as ipr:
+            # Bring up loopback
+            lo_idx = ipr.link_lookup(ifname='lo')[0]
+            ipr.link('set', index=lo_idx, state='up')
 
-        # Bring up loopback
-        lo_idx = ipr.link_lookup(ifname='lo')[0]
-        ipr.link('set', index=lo_idx, state='up')
+            # Configure container-side veth
+            cont_idx = ipr.link_lookup(ifname=self.cont_if)
+            if not cont_idx:
+                # Interface not found — this can happen if the namespace
+                # setup failed silently
+                getLog().warning("NAT: container interface %s not found in namespace",
+                                 self.cont_if)
+                return
 
-        # Configure container-side veth
-        cont_idx = ipr.link_lookup(ifname=self.cont_if)
-        if not cont_idx:
-            # Interface not found — this can happen if the namespace
-            # setup failed silently
-            getLog().warning("NAT: container interface %s not found in namespace",
-                             self.cont_if)
-            return
+            cont_idx = cont_idx[0]
+            ipr.link('set', index=cont_idx, state='up')
 
-        cont_idx = cont_idx[0]
-        ipr.link('set', index=cont_idx, state='up')
+            # IPv4 address and default route
+            ipr.addr('add', index=cont_idx, address=self.cont_ip_v4,
+                     mask=self.mask_v4)
+            ipr.route('add', dst='default', gateway=self.host_ip_v4)
 
-        # IPv4 address and default route
-        ipr.addr('add', index=cont_idx, address=self.cont_ip_v4,
-                 mask=self.mask_v4)
-        ipr.route('add', dst='default', gateway=self.host_ip_v4)
-
-        # IPv6 address and default route
-        if self.cont_ip_v6:
-            ipr.addr('add', index=cont_idx, address=self.cont_ip_v6,
-                     mask=self.mask_v6)
-            ipr.route('add', dst='default', gateway=self.host_ip_v6)
+            # IPv6 address and default route
+            if self.cont_ip_v6:
+                ipr.addr('add', index=cont_idx, address=self.cont_ip_v6,
+                         mask=self.mask_v6)
+                ipr.route('add', dst='default', gateway=self.host_ip_v6)
 
     @traceLog()
     def teardown(self):
@@ -538,10 +537,10 @@ class NatNetwork:
 
         # Delete the veth pair (deleting the host end removes both ends)
         try:
-            ipr = IPRoute()
-            host_idx = ipr.link_lookup(ifname=self.host_if)
-            if host_idx:
-                ipr.link('del', index=host_idx[0])
+            with IPRoute() as ipr:
+                host_idx = ipr.link_lookup(ifname=self.host_if)
+                if host_idx:
+                    ipr.link('del', index=host_idx[0])
         except Exception as e:
             log.warning("NAT: failed to delete veth %s: %s", self.host_if, e)
 
@@ -786,11 +785,11 @@ def cleanup_orphaned_networks(pool_v4='', pool_v6=''):
 
         # Delete the veth interface
         try:
-            ipr = IPRoute()
-            host_idx = ipr.link_lookup(ifname=host_if)
-            if host_idx:
-                ipr.link('del', index=host_idx[0])
-                log.info("NAT: removed orphaned veth %s", host_if)
+            with IPRoute() as ipr:
+                host_idx = ipr.link_lookup(ifname=host_if)
+                if host_idx:
+                    ipr.link('del', index=host_idx[0])
+                    log.info("NAT: removed orphaned veth %s", host_if)
         except Exception as e:
             log.warning("NAT: failed to delete veth %s: %s", host_if, e)
 
@@ -804,36 +803,36 @@ def cleanup_orphaned_networks(pool_v4='', pool_v6=''):
     # Step 3: Scan for any vm-m-* interfaces whose namespace is NOT
     # in the lock file — these are truly orphaned.
     try:
-        ipr = IPRoute()
-        for link in ipr.get_links():
-            ifname = link.get_attr('IFLA_IFNAME', '')
-            if not ifname.startswith('vm-m-'):
-                continue
-            ns_name = ifname[3:]  # strip "vm-" prefix to get namespace name
-            # Check if this namespace is still tracked in the lock file
-            _ensure_lock_dir()
-            lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_SH)
-                entries = pool._read_lock_file(lock_fd)
-                ns_in_use = any(e[2] == ns_name for e in entries)
-            finally:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
+        with IPRoute() as ipr:
+            for link in ipr.get_links():
+                ifname = link.get_attr('IFLA_IFNAME', '')
+                if not ifname.startswith('vm-m-'):
+                    continue
+                ns_name = ifname[3:]  # strip "vm-" prefix to get namespace name
+                # Check if this namespace is still tracked in the lock file
+                _ensure_lock_dir()
+                lock_fd = os.open(_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_SH)
+                    entries = pool._read_lock_file(lock_fd)
+                    ns_in_use = any(e[2] == ns_name for e in entries)
+                finally:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
 
-            if not ns_in_use:
-                log.info("NAT: cleaning up truly orphaned interface %s "
-                         "(ns=%s not in lock file)", ifname, ns_name)
-                try:
-                    ipr.link('del', index=link['index'])
-                except Exception as e:
-                    log.warning("NAT: failed to delete orphaned veth %s: %s",
-                                ifname, e)
-                try:
-                    netns.remove(ns_name)
-                except Exception as e:
-                    log.warning("NAT: failed to remove orphaned ns %s: %s",
-                                ns_name, e)
+                if not ns_in_use:
+                    log.info("NAT: cleaning up truly orphaned interface %s "
+                             "(ns=%s not in lock file)", ifname, ns_name)
+                    try:
+                        ipr.link('del', index=link['index'])
+                    except Exception as e:
+                        log.warning("NAT: failed to delete orphaned veth %s: %s",
+                                    ifname, e)
+                    try:
+                        netns.remove(ns_name)
+                    except Exception as e:
+                        log.warning("NAT: failed to remove orphaned ns %s: %s",
+                                    ns_name, e)
     except Exception as e:
         log.warning("NAT: orphan interface scan failed: %s", e)
 
