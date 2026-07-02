@@ -591,11 +591,14 @@ class NatNetwork:
         resolv_path = os.path.join(self.chroot_path, 'etc', 'resolv.conf')
 
         # Back up the existing resolv.conf
-        try:
-            with open(resolv_path, 'rb') as f:
-                self._resolv_backup = f.read()
-        except (IOError, OSError):
-            self._resolv_backup = None
+        if os.path.exists(resolv_path):
+            try:
+                with open(resolv_path, 'rb') as f:
+                    self._resolv_backup = f.read()
+            except OSError:
+                self._resolv_backup = None
+        else:
+            self._resolv_backup = False
 
         # Build a new resolv.conf with reachable nameservers
         fallback_dns = self.config.get('network_fallback_dns', None)
@@ -616,12 +619,29 @@ class NatNetwork:
     def _teardown_dns(self):
         """
         Restore the original resolv.conf that was backed up during _setup_dns.
+
+        If resolv.conf did not exist before setup (``_resolv_backup is
+        False``), the temporary file is deleted to restore the chroot to
+        its original state.
         """
         log = getLog()
         if self._resolv_backup is None:
             return
 
         resolv_path = os.path.join(self.chroot_path, 'etc', 'resolv.conf')
+        if self._resolv_backup is False:
+            # resolv.conf did not exist before setup — remove the temporary file
+            try:
+                os.remove(resolv_path)
+                log.debug("NAT: removed temporary resolv.conf")
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.warning("NAT: failed to remove temporary resolv.conf: %s", e)
+            finally:
+                self._resolv_backup = None
+            return
+
         try:
             with open(resolv_path, 'wb') as f:
                 f.write(self._resolv_backup)
