@@ -408,8 +408,8 @@ class NatNetwork:
         if self.v6_net:
             self._setup_ip6tables_nat()
 
-        # 8. Enable IP forwarding (idempotent)
-        self._enable_forwarding()
+        # 8. Verify IP forwarding is enabled (required for NAT)
+        self._check_forwarding()
 
         # 9. Set up DNS resolution in the chroot
         if self.chroot_path:
@@ -465,12 +465,26 @@ class NatNetwork:
         )
 
     @traceLog()
-    def _enable_forwarding(self):
-        """Enable IPv4 and IPv6 forwarding (idempotent)."""
-        subprocess.run(['sysctl', '-w', 'net.ipv4.ip_forward=1'],
-                       check=True, stdout=subprocess.DEVNULL)
-        subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.forwarding=1'],
-                       check=True, stdout=subprocess.DEVNULL)
+    def _check_forwarding(self):
+        """Verify that IP forwarding is enabled on the host.
+
+        NAT-based network isolation requires the host kernel to forward
+        packets between the veth interface and the external network.
+        This is a read-only check — the operator is responsible for
+        enabling forwarding (see site-defaults.cfg for details).
+        """
+        with open('/proc/sys/net/ipv4/ip_forward') as f:
+            if f.read().strip() != '1':
+                raise RuntimeError(
+                    "IPv4 forwarding is not enabled. Set net.ipv4.ip_forward=1 "
+                    "on the host or use a configuration that does not require NAT.")
+        if self.v6_net:
+            with open('/proc/sys/net/ipv6/conf/all/forwarding') as f:
+                if f.read().strip() != '1':
+                    raise RuntimeError(
+                        "IPv6 forwarding is not enabled. Set "
+                        "net.ipv6.conf.all.forwarding=1 on the host or disable "
+                        "IPv6 NAT by omitting network_veth_subnet_block_v6.")
 
     @traceLog()
     def configure_container_ns(self):
